@@ -43,6 +43,11 @@ struct Cli {
     /// This is to avoid causing a lot of load on the OSM servers
     #[arg(long, default_value = "500")]
     wait_time: u64,
+    /// If we should use torrent files from the cache instead for changesets
+    ///
+    /// These need to be downloaded manually and be put into the cache_folder/changesets/torrents folder
+    #[arg(long)]
+    use_torrents: bool,
 }
 
 #[tokio::main]
@@ -79,100 +84,105 @@ async fn main() -> Result<()> {
     )?;
     info!("Git repository initialized");
 
-    // Main download loop
-    let mut changeset_position_top = cli.start_changesets[0..3].parse::<u64>()?;
-    let mut changeset_position_middle = cli.start_changesets[4..7].parse::<u64>()?;
-    let mut changeset_position_bottom = cli.start_changesets[8..11].parse::<u64>()?;
-    let mut changeset_position_middle_incremented = false;
-    let mut changeset_position_top_incremented = false;
+    if !cli.use_torrents {
+        // Main download loop
+        let mut changeset_position_top = cli.start_changesets[0..3].parse::<u64>()?;
+        let mut changeset_position_middle = cli.start_changesets[4..7].parse::<u64>()?;
+        let mut changeset_position_bottom = cli.start_changesets[8..11].parse::<u64>()?;
+        let mut changeset_position_middle_incremented = false;
+        let mut changeset_position_top_incremented = false;
 
-    loop {
-        // Check for cache and use it if it exists
-        let cache_file_path = format!(
-            "{}/changesets/{:03}/{:03}/{:03}.osm.gz",
-            cli.cache_path,
-            changeset_position_top,
-            changeset_position_middle,
-            changeset_position_bottom
-        );
-
-        if std::path::Path::new(&cache_file_path).exists() {
-            info!(
-                "We already got the changeset file at {}. Skipping",
-                cache_file_path
+        loop {
+            // Check for cache and use it if it exists
+            let cache_file_path = format!(
+                "{}/changesets/{:03}/{:03}/{:03}.osm.gz",
+                cli.cache_path,
+                changeset_position_top,
+                changeset_position_middle,
+                changeset_position_bottom
             );
 
-            // Increment the changeset position
-            changeset_position_bottom += 1;
-            changeset_position_middle_incremented = false;
-            changeset_position_top_incremented = false;
-        } else {
-            {
-                // First we download the changeset files
-                let changeset_url = format!(
-                    "{}/{:03}/{:03}/{:03}.osm.gz",
-                    cli.changeset_server,
-                    changeset_position_top,
-                    changeset_position_middle,
-                    changeset_position_bottom
+            if std::path::Path::new(&cache_file_path).exists() {
+                info!(
+                    "We already got the changeset file at {}. Skipping",
+                    cache_file_path
                 );
-                info!("Downloading changeset file from {}", changeset_url);
-                let changeset_response: reqwest::Response =
-                    client.get(&changeset_url).send().await?;
-                if changeset_response.status() == reqwest::StatusCode::NOT_FOUND {
-                    warn!("Changeset file not found at {}", changeset_url);
-                    // We've reached the end of the changesets for this bottom position.
-                    // If we incremented top and failed again, we're done.
-                    if changeset_position_top_incremented {
-                        info!("Finished or failed downloading changesets");
-                        info!(
-                            "Changeset position: {} {} {}",
-                            changeset_position_top,
-                            changeset_position_middle,
-                            changeset_position_bottom
-                        );
-                        warn!("Response body: {:?}", changeset_response.text().await?);
-                        // TODO: We want to have an endless loop here optionally so that we can keep trying to download changesets.
-                        break;
+
+                // Increment the changeset position
+                changeset_position_bottom += 1;
+                changeset_position_middle_incremented = false;
+                changeset_position_top_incremented = false;
+            } else {
+                {
+                    // First we download the changeset files
+                    let changeset_url = format!(
+                        "{}/{:03}/{:03}/{:03}.osm.gz",
+                        cli.changeset_server,
+                        changeset_position_top,
+                        changeset_position_middle,
+                        changeset_position_bottom
+                    );
+                    info!("Downloading changeset file from {}", changeset_url);
+                    let changeset_response: reqwest::Response =
+                        client.get(&changeset_url).send().await?;
+                    if changeset_response.status() == reqwest::StatusCode::NOT_FOUND {
+                        warn!("Changeset file not found at {}", changeset_url);
+                        // We've reached the end of the changesets for this bottom position.
+                        // If we incremented top and failed again, we're done.
+                        if changeset_position_top_incremented {
+                            info!("Finished or failed downloading changesets");
+                            info!(
+                                "Changeset position: {} {} {}",
+                                changeset_position_top,
+                                changeset_position_middle,
+                                changeset_position_bottom
+                            );
+                            warn!("Response body: {:?}", changeset_response.text().await?);
+                            // TODO: We want to have an endless loop here optionally so that we can keep trying to download changesets.
+                            break;
+                        }
+                        // We reset bottom to 0 and increment middle.
+                        // We also mark middle as incremented so that we increment top on the next failure.
+                        if !changeset_position_middle_incremented && changeset_position_bottom != 0
+                        {
+                            changeset_position_bottom = 0;
+                            changeset_position_middle += 1;
+                            changeset_position_middle_incremented = true;
+                            changeset_position_top_incremented = false;
+                        } else {
+                            changeset_position_middle_incremented = false;
+                            changeset_position_top += 1;
+                            changeset_position_top_incremented = true;
+                            changeset_position_middle = 0;
+                            changeset_position_bottom = 0;
+                        }
+                        continue;
                     }
-                    // We reset bottom to 0 and increment middle.
-                    // We also mark middle as incremented so that we increment top on the next failure.
-                    if !changeset_position_middle_incremented && changeset_position_bottom != 0 {
-                        changeset_position_bottom = 0;
-                        changeset_position_middle += 1;
-                        changeset_position_middle_incremented = true;
-                        changeset_position_top_incremented = false;
-                    } else {
-                        changeset_position_middle_incremented = false;
-                        changeset_position_top += 1;
-                        changeset_position_top_incremented = true;
-                        changeset_position_middle = 0;
-                        changeset_position_bottom = 0;
-                    }
-                    continue;
-                }
-                let changeset_data = changeset_response.bytes().await?;
-                info!("Caching changeset file to disk");
-                std::fs::create_dir_all(std::path::Path::new(&cache_file_path).parent().unwrap())?;
-                std::fs::write(&cache_file_path, &changeset_data)?;
-                info!("Changeset file downloaded");
-            };
+                    let changeset_data = changeset_response.bytes().await?;
+                    info!("Caching changeset file to disk");
+                    std::fs::create_dir_all(
+                        std::path::Path::new(&cache_file_path).parent().unwrap(),
+                    )?;
+                    std::fs::write(&cache_file_path, &changeset_data)?;
+                    info!("Changeset file downloaded");
+                };
 
-            // TODO: We need to dynamically do this based on the data instead. Otherwise we dont have ram larrge enough
-            // let file = File::open(cache_file_path)?;
-            // let changeset_data = unsafe { Mmap::map(&file)? };
+                // TODO: We need to dynamically do this based on the data instead. Otherwise we dont have ram larrge enough
+                // let file = File::open(cache_file_path)?;
+                // let changeset_data = unsafe { Mmap::map(&file)? };
 
-            // let parsed_changeset = parse_changeset(&changeset_data)?;
-            // info!("Changeset file parsed");
-            // changesets.extend(parsed_changeset);
+                // let parsed_changeset = parse_changeset(&changeset_data)?;
+                // info!("Changeset file parsed");
+                // changesets.extend(parsed_changeset);
 
-            // Increment the changeset position
-            changeset_position_bottom += 1;
-            changeset_position_middle_incremented = false;
-            changeset_position_top_incremented = false;
+                // Increment the changeset position
+                changeset_position_bottom += 1;
+                changeset_position_middle_incremented = false;
+                changeset_position_top_incremented = false;
 
-            // Wait a few seconds before downloading the next changeset file
-            tokio::time::sleep(Duration::from_millis(cli.wait_time)).await;
+                // Wait a few seconds before downloading the next changeset file
+                tokio::time::sleep(Duration::from_millis(cli.wait_time)).await;
+            }
         }
     }
 
@@ -188,17 +198,20 @@ async fn main() -> Result<()> {
         // Check for cache and use it if it exists
         let cache_file_path = format!(
             "{}/replication/{:03}/{:03}/{:03}.osm.gz",
-            cli.cache_path,
-            changeset_position_top,
-            changeset_position_middle,
-            changeset_position_bottom
+            cli.cache_path, data_position_top, data_position_middle, data_position_bottom
         );
 
         if std::path::Path::new(&cache_file_path).exists() {
             info!("Using cached data file at {}", cache_file_path);
             let file = File::open(&cache_file_path)?;
             let data = unsafe { Mmap::map(&file)? };
-            convert_objects_to_git(&repository, &author, &data, cli.cache_path.clone())?;
+            convert_objects_to_git(
+                &repository,
+                &author,
+                &data,
+                cli.cache_path.clone(),
+                cli.use_torrents,
+            )?;
             info!("Data file parsed");
 
             // Increment the data position
@@ -260,7 +273,13 @@ async fn main() -> Result<()> {
             let file = File::open(cache_file_path)?;
             let data = unsafe { Mmap::map(&file)? };
 
-            convert_objects_to_git(&repository, &author, &data, cli.cache_path.clone())?;
+            convert_objects_to_git(
+                &repository,
+                &author,
+                &data,
+                cli.cache_path.clone(),
+                cli.use_torrents,
+            )?;
 
             // Increment the data position
             data_position_bottom += 1;
@@ -272,12 +291,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!(
-        "Downloaded changesets until {} {} {}",
-        changeset_position_top,
-        changeset_position_middle,
-        changeset_position_bottom - 1
-    );
     info!(
         "Downloaded data until {} {} {}",
         data_position_top,

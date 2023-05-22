@@ -17,6 +17,7 @@ use std::{
 };
 use time::{format_description::well_known::Iso8601, OffsetDateTime};
 use tracing::{debug, error, info, warn};
+use walkdir::WalkDir;
 
 use crate::git::commit;
 
@@ -472,6 +473,7 @@ pub fn convert_objects_to_git(
     committer: &Signature,
     data: &[u8],
     cache_folder: String,
+    use_torrents: bool,
 ) -> Result<()> {
     // If the file is empty we skip it
     if data.is_empty() {
@@ -848,8 +850,14 @@ pub fn convert_objects_to_git(
 
     for changeset in changeset_list {
         // Find the changeset within the files of the cache
-        let changeset =
-            find_changesets_in_cache(cache_folder.clone(), *changeset, None, None, None)?;
+        let changeset = find_changesets_in_cache(
+            cache_folder.clone(),
+            use_torrents,
+            *changeset,
+            None,
+            None,
+            None,
+        )?;
 
         if let Some(changeset) = changeset {
             // Get comment tag if it exists and trim it
@@ -947,6 +955,7 @@ pub fn convert_objects_to_git(
 /// The changeset if found
 fn find_changesets_in_cache(
     cache_folder: String,
+    use_torrents: bool,
     changeset_id: u64,
     changeset_position_top: Option<u64>,
     changeset_position_middle: Option<u64>,
@@ -956,57 +965,80 @@ fn find_changesets_in_cache(
     //
     // Each file has to be parsed using "parse_changeset(&changeset_data)?;"
 
-    let changeset_folder = format!("{}/changesets", cache_folder);
-    let mut changeset_position_top = changeset_position_top.unwrap_or(0);
-    let mut changeset_position_middle = changeset_position_middle.unwrap_or(0);
-    let mut changeset_position_bottom = changeset_position_bottom.unwrap_or(0);
-    let changeset_file = format!(
-        "{:03}/{:03}/{:03}.osm.gz",
-        changeset_position_top, changeset_position_middle, changeset_position_bottom
-    );
-    let changeset_path = format!("{}/{}", changeset_folder, changeset_file);
+    let changeset_folder = if use_torrents {
+        format!("{}/changesets/torrents", cache_folder)
+    } else {
+        format!("{}/changesets", cache_folder)
+    };
 
-    if !Path::new(&changeset_path).exists() {
-        return Ok(None);
+    if !use_torrents {
+        let mut changeset_position_top = changeset_position_top.unwrap_or(0);
+        let mut changeset_position_middle = changeset_position_middle.unwrap_or(0);
+        let mut changeset_position_bottom = changeset_position_bottom.unwrap_or(0);
+        let changeset_file = format!(
+            "{:03}/{:03}/{:03}.osm.gz",
+            changeset_position_top, changeset_position_middle, changeset_position_bottom
+        );
+        let changeset_path = format!("{}/{}", changeset_folder, changeset_file);
+
+        if !Path::new(&changeset_path).exists() {
+            return Ok(None);
+        }
+
+        let mut changeset_file = File::open(changeset_path)?;
+        let mut changeset_data = Vec::new();
+        changeset_file.read_to_end(&mut changeset_data)?;
+
+        let changesets = parse_changeset(&changeset_data)?;
+
+        // Check if the file has the correct changeset id in vector otherwise we recurse to the next file
+        if changesets.iter().any(|c| c.id == changeset_id) {
+            return Ok(changesets.into_iter().find(|c| c.id == changeset_id));
+        }
+
+        // We recurse to the next file since we found no changeset with the correct id
+
+        if changeset_position_top == 999
+            && changeset_position_middle == 999
+            && changeset_position_bottom == 999
+        {
+            // Uhhhhhh?!
+            return Ok(None);
+        }
+
+        if changeset_position_middle == 999 && changeset_position_bottom == 999 {
+            changeset_position_middle = 0;
+            changeset_position_bottom = 0;
+            changeset_position_top += 1;
+        }
+
+        if changeset_position_bottom == 999 {
+            changeset_position_bottom = 0;
+            changeset_position_middle += 1;
+        }
+
+        find_changesets_in_cache(
+            cache_folder,
+            use_torrents,
+            changeset_id,
+            Some(changeset_position_top),
+            Some(changeset_position_middle),
+            Some(changeset_position_bottom),
+        )
+    } else {
+        let mut changeset: Option<Changeset> = None;
+
+        for entry in WalkDir::new(changeset_folder) {
+            let mut changeset_file = File::open(entry?.path())?;
+            let mut changeset_data = Vec::new();
+            changeset_file.read_to_end(&mut changeset_data)?;
+
+            let changesets = parse_changeset(&changeset_data)?;
+            if changesets.iter().any(|c| c.id == changeset_id) {
+                changeset = changesets.into_iter().find(|c| c.id == changeset_id);
+            }
+        }
+
+        Ok(changeset)
     }
-
-    let mut changeset_file = File::open(changeset_path)?;
-    let mut changeset_data = Vec::new();
-    changeset_file.read_to_end(&mut changeset_data)?;
-
-    let changesets = parse_changeset(&changeset_data)?;
-
-    // Check if the file has the correct changeset id in vector otherwise we recurse to the next file
-    if changesets.iter().any(|c| c.id == changeset_id) {
-        return Ok(changesets.into_iter().find(|c| c.id == changeset_id));
-    }
-
-    // We recurse to the next file since we found no changeset with the correct id
-
-    if changeset_position_top == 999
-        && changeset_position_middle == 999
-        && changeset_position_bottom == 999
-    {
-        // Uhhhhhh?!
-        return Ok(None);
-    }
-
-    if changeset_position_middle == 999 && changeset_position_bottom == 999 {
-        changeset_position_middle = 0;
-        changeset_position_bottom = 0;
-        changeset_position_top += 1;
-    }
-
-    if changeset_position_bottom == 999 {
-        changeset_position_bottom = 0;
-        changeset_position_middle += 1;
-    }
-
-    find_changesets_in_cache(
-        cache_folder,
-        changeset_id,
-        Some(changeset_position_top),
-        Some(changeset_position_middle),
-        Some(changeset_position_bottom),
-    )
 }
