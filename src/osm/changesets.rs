@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use color_eyre::eyre::Result;
 use flate2::bufread::GzDecoder;
 use quick_xml::{
@@ -137,13 +136,13 @@ impl Changeset {
     }
 }
 
-pub fn parse_changeset(changeset_data: Bytes) -> Result<Vec<Changeset>> {
+pub fn parse_changeset(changeset_data: &[u8]) -> Result<Vec<Changeset>> {
     // If file is empty, return an empty vector
     if changeset_data.is_empty() {
         return Ok(Vec::new());
     }
     // Decompress the changeset file
-    let mut changeset_data_reader = GzDecoder::new(&changeset_data[..]);
+    let mut changeset_data_reader = GzDecoder::new(changeset_data);
     let mut changeset_data = String::new();
     changeset_data_reader.read_to_string(&mut changeset_data)?;
     debug!(

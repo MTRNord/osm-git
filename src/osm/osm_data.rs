@@ -11,14 +11,16 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     convert::Infallible,
+    fs::File,
     io::{Read, Write},
+    path::Path,
 };
 use time::{format_description::well_known::Iso8601, OffsetDateTime};
 use tracing::{debug, error, info, warn};
 
 use crate::git::commit;
 
-use super::changesets::Changeset;
+use super::changesets::{parse_changeset, Changeset};
 
 const FILE_VERSION: &str = "0.1.0";
 
@@ -468,8 +470,8 @@ pub enum OSMObject {
 pub fn convert_objects_to_git(
     repository: &Repository,
     committer: &Signature,
-    changesets: &[Changeset],
     data: &[u8],
+    cache_folder: String,
 ) -> Result<()> {
     // If the file is empty we skip it
     if data.is_empty() {
@@ -845,83 +847,166 @@ pub fn convert_objects_to_git(
         .collect();
 
     for changeset in changeset_list {
-        // Construct the commit and apply it
-        let changeset = changesets
-            .iter()
-            .find(|c| c.id == *changeset)
-            .expect("Unable to find changeset");
+        // Find the changeset within the files of the cache
+        let changeset =
+            find_changesets_in_cache(cache_folder.clone(), *changeset, None, None, None)?;
 
-        // Get comment tag if it exists and trim it
-        let comment = changeset
-            .tags
-            .get("comment")
-            .map(|s| s.trim())
-            .unwrap_or("");
+        if let Some(changeset) = changeset {
+            // Get comment tag if it exists and trim it
+            let comment = changeset
+                .tags
+                .get("comment")
+                .map(|s| s.trim())
+                .unwrap_or("");
 
-        // Parse changeset time (ISO 8601) to git time (seconds since epoch) with offset 0 (UTC) using `time`
-        let changeset_time = changeset
-            .closed_at
-            .clone()
-            .unwrap_or(changeset.created_at.clone());
-        let commit_time =
-            OffsetDateTime::parse(changeset_time.as_str(), &Iso8601::DEFAULT)?.unix_timestamp();
+            // Parse changeset time (ISO 8601) to git time (seconds since epoch) with offset 0 (UTC) using `time`
+            let changeset_time = changeset
+                .closed_at
+                .clone()
+                .unwrap_or(changeset.created_at.clone());
+            let commit_time =
+                OffsetDateTime::parse(changeset_time.as_str(), &Iso8601::DEFAULT)?.unix_timestamp();
 
-        let author = git2::Signature::new(
-            &changeset.user,
-            &format!("{}@osm", changeset.user),
-            &Time::new(commit_time, 0),
-        )
-        .expect("Unable to create author signature");
+            let author = git2::Signature::new(
+                &changeset.user,
+                &format!("{}@osm", changeset.user),
+                &Time::new(commit_time, 0),
+            )
+            .expect("Unable to create author signature");
 
-        let repository_folder = repository.path().parent().unwrap();
+            let repository_folder = repository.path().parent().unwrap();
 
-        let added_or_changed_files = created_or_modified_objects_for_changeset
-            .get(&changeset.id)
-            .unwrap_or(&Vec::new())
-            .iter()
-            .map(|object| match object {
-                OSMObject::Node(ref node) => repository_folder.join(format!("{}.yaml", node.id)),
-                OSMObject::Way(ref way) => repository_folder.join(format!("{}.yaml", way.id)),
-                OSMObject::Relation(ref relation) => {
-                    repository_folder.join(format!("{}.yaml", relation.id))
-                }
-            })
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<String>>();
+            let added_or_changed_files = created_or_modified_objects_for_changeset
+                .get(&changeset.id)
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(|object| match object {
+                    OSMObject::Node(ref node) => {
+                        repository_folder.join(format!("{}.yaml", node.id))
+                    }
+                    OSMObject::Way(ref way) => repository_folder.join(format!("{}.yaml", way.id)),
+                    OSMObject::Relation(ref relation) => {
+                        repository_folder.join(format!("{}.yaml", relation.id))
+                    }
+                })
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<String>>();
 
-        let removed_files = deleted_objects_for_changeset
-            .get(&changeset.id)
-            .unwrap_or(&Vec::new())
-            .iter()
-            .map(|object| match object {
-                OSMObject::Node(ref node) => repository_folder.join(format!("{}.yaml", node.id)),
-                OSMObject::Way(ref way) => repository_folder.join(format!("{}.yaml", way.id)),
-                OSMObject::Relation(ref relation) => {
-                    repository_folder.join(format!("{}.yaml", relation.id))
-                }
-            })
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<String>>();
+            let removed_files = deleted_objects_for_changeset
+                .get(&changeset.id)
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(|object| match object {
+                    OSMObject::Node(ref node) => {
+                        repository_folder.join(format!("{}.yaml", node.id))
+                    }
+                    OSMObject::Way(ref way) => repository_folder.join(format!("{}.yaml", way.id)),
+                    OSMObject::Relation(ref relation) => {
+                        repository_folder.join(format!("{}.yaml", relation.id))
+                    }
+                })
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<String>>();
 
-        let oid = commit(
-            repository,
-            added_or_changed_files,
-            removed_files,
-            comment,
-            &author,
-            committer,
-        )?;
+            let oid = commit(
+                repository,
+                added_or_changed_files,
+                removed_files,
+                comment,
+                &author,
+                committer,
+            )?;
 
-        // Convert tags to "Key: Value" strings separated by newlines for the note
-        let note = changeset
-            .tags
-            .iter()
-            .map(|(key, value)| format!("{}: {}", key, value))
-            .collect::<Vec<String>>()
-            .join("\n");
+            // Convert tags to "Key: Value" strings separated by newlines for the note
+            let note = changeset
+                .tags
+                .iter()
+                .map(|(key, value)| format!("{}: {}", key, value))
+                .collect::<Vec<String>>()
+                .join("\n");
 
-        repository.note(&author, committer, None, oid, &note, false)?;
+            repository.note(&author, committer, None, oid, &note, false)?;
+
+            // We make sure to not keep it around since this would get large quite quickly
+            drop(changeset);
+        }
     }
 
     Ok(())
+}
+
+/// Scans the files in the cache folder and returns the requested changeset
+///
+/// # Arguments
+///
+/// * `cache_folder` - The folder where the changesets are stored
+/// * `changeset_id` - The id of the changeset to find
+///
+/// # Returns
+///
+/// The changeset if found
+fn find_changesets_in_cache(
+    cache_folder: String,
+    changeset_id: u64,
+    changeset_position_top: Option<u64>,
+    changeset_position_middle: Option<u64>,
+    changeset_position_bottom: Option<u64>,
+) -> Result<Option<Changeset>> {
+    // Changesets are of the format "{cache_folder}/changesets/{:03}/{:03}/{:03}.osm.gz".
+    //
+    // Each file has to be parsed using "parse_changeset(&changeset_data)?;"
+
+    let changeset_folder = format!("{}/changesets", cache_folder);
+    let mut changeset_position_top = changeset_position_top.unwrap_or(0);
+    let mut changeset_position_middle = changeset_position_middle.unwrap_or(0);
+    let mut changeset_position_bottom = changeset_position_bottom.unwrap_or(0);
+    let changeset_file = format!(
+        "{:03}/{:03}/{:03}.osm.gz",
+        changeset_position_top, changeset_position_middle, changeset_position_bottom
+    );
+    let changeset_path = format!("{}/{}", changeset_folder, changeset_file);
+
+    if !Path::new(&changeset_path).exists() {
+        return Ok(None);
+    }
+
+    let mut changeset_file = File::open(changeset_path)?;
+    let mut changeset_data = Vec::new();
+    changeset_file.read_to_end(&mut changeset_data)?;
+
+    let changesets = parse_changeset(&changeset_data)?;
+
+    // Check if the file has the correct changeset id in vector otherwise we recurse to the next file
+    if changesets.iter().any(|c| c.id == changeset_id) {
+        return Ok(changesets.into_iter().find(|c| c.id == changeset_id));
+    }
+
+    // We recurse to the next file since we found no changeset with the correct id
+
+    if changeset_position_top == 999
+        && changeset_position_middle == 999
+        && changeset_position_bottom == 999
+    {
+        // Uhhhhhh?!
+        return Ok(None);
+    }
+
+    if changeset_position_middle == 999 && changeset_position_bottom == 999 {
+        changeset_position_middle = 0;
+        changeset_position_bottom = 0;
+        changeset_position_top += 1;
+    }
+
+    if changeset_position_bottom == 999 {
+        changeset_position_bottom = 0;
+        changeset_position_middle += 1;
+    }
+
+    find_changesets_in_cache(
+        cache_folder,
+        changeset_id,
+        Some(changeset_position_top),
+        Some(changeset_position_middle),
+        Some(changeset_position_bottom),
+    )
 }

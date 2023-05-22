@@ -107,6 +107,7 @@ pub fn commit(
         for file in removed_files {
             index.remove_path(std::path::Path::new(&file))?;
         }
+        index.write()?;
         index.write_tree()?
     };
     let tree = repository.find_tree(tree_id)?;
