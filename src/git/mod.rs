@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{io::Write, path::Path};
 
 use color_eyre::eyre::Result;
 use git2::{Oid, Repository, Signature};
@@ -23,7 +23,6 @@ pub fn init_git_repository(
     git_repo_path: &str,
     data_url: &str,
     author: &Signature,
-    changeset_url: &str,
 ) -> Result<Repository> {
     // Check if the git repo already exists
     if std::path::Path::new(git_repo_path).exists() {
@@ -39,7 +38,7 @@ pub fn init_git_repository(
     // Create the git repo if it doesn't exist
     let repository = Repository::init(git_repo_path)?;
 
-    generate_readme_from_template(&repository, data_url, changeset_url)?;
+    generate_readme_from_template(&repository, data_url)?;
 
     // Commit the README.md file
     commit(
@@ -54,16 +53,11 @@ pub fn init_git_repository(
 }
 
 /// Generate the README.md file from the template and write it to the git repo
-pub fn generate_readme_from_template(
-    repository: &Repository,
-    data_url: &str,
-    changeset_url: &str,
-) -> Result<()> {
+pub fn generate_readme_from_template(repository: &Repository, data_url: &str) -> Result<()> {
     let template_file = include_str!("../../templates/README.md");
 
     // Replace the template variables with the actual values
     let template_file = template_file.replace("$server_url", data_url);
-    let template_file = template_file.replace("$changeset_server_url", changeset_url);
 
     // Get the version of this binary
     let version = env!("CARGO_PKG_VERSION");
@@ -102,16 +96,35 @@ pub fn commit(
     let tree_id = {
         let mut index = repository.index()?;
         for file in added_or_changed_files {
-            index.add_path(std::path::Path::new(&file))?;
+            let file_path = Path::new(&file);
+            let path = if file_path.starts_with(repository.path().parent().unwrap()) {
+                Path::new(&file).strip_prefix(repository.path().parent().unwrap())?
+            } else {
+                Path::new(&file)
+            };
+            index.add_path(path)?;
         }
         for file in removed_files {
-            index.remove_path(std::path::Path::new(&file))?;
+            let file_path = Path::new(&file);
+            let path = if file_path.starts_with(repository.path().parent().unwrap()) {
+                Path::new(&file).strip_prefix(repository.path().parent().unwrap())?
+            } else {
+                Path::new(&file)
+            };
+            index.remove_path(path)?;
         }
         index.write()?;
         index.write_tree()?
     };
     let tree = repository.find_tree(tree_id)?;
+    let head_id = repository.refname_to_id("HEAD");
+    if let Ok(head_id) = head_id {
+        let parent = repository.find_commit(head_id)?;
 
-    let oid = repository.commit(Some("HEAD"), author, committer, message, &tree, &[])?;
-    Ok(oid)
+        let oid = repository.commit(Some("HEAD"), author, committer, message, &tree, &[&parent])?;
+        Ok(oid)
+    } else {
+        let oid = repository.commit(Some("HEAD"), author, committer, message, &tree, &[])?;
+        Ok(oid)
+    }
 }

@@ -2,3 +2,6 @@
 /osm-git-repo
 /debug.xml
 /cache
+/perf.data
+/perf.data.old
+/flamegraph.svg

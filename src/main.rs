@@ -24,30 +24,19 @@ struct Cli {
         default_value = "https://planet.openstreetmap.org/replication/day"
     )]
     replication_server: String,
-    /// The server to get changeset data from
-    #[arg(
-        long,
-        default_value = "https://planet.openstreetmap.org/replication/changesets"
-    )]
-    changeset_server: String,
     /// Where to write cache files
     #[arg(long, default_value = "./cache")]
     cache_path: String,
     /// If the git repo should be removed and recreated
     #[arg(short, long)]
     clean: bool,
-    /// Where to start downloading changesets from
+    /// Where to start downloading data from
     #[arg(long, default_value = "000/000/000")]
-    start_changesets: String,
-    /// The time to wait between downloading changesets
+    start_data: String,
+    /// The time to wait between downloading data
     /// This is to avoid causing a lot of load on the OSM servers
     #[arg(long, default_value = "500")]
     wait_time: u64,
-    /// If we should use torrent files from the cache instead for changesets
-    ///
-    /// These need to be downloaded manually and be put into the cache_folder/changesets/torrents folder
-    #[arg(long)]
-    use_torrents: bool,
 }
 
 #[tokio::main]
@@ -76,122 +65,14 @@ async fn main() -> Result<()> {
 
     let author = Signature::now("osm-git-replay", "osm-git-replay@localhost")?;
 
-    let repository = init_git_repository(
-        &cli.git_repo_path,
-        &cli.replication_server,
-        &author,
-        &cli.changeset_server,
-    )?;
+    let repository = init_git_repository(&cli.git_repo_path, &cli.replication_server, &author)?;
     info!("Git repository initialized");
 
-    if !cli.use_torrents {
-        // Main download loop
-        let mut changeset_position_top = cli.start_changesets[0..3].parse::<u64>()?;
-        let mut changeset_position_middle = cli.start_changesets[4..7].parse::<u64>()?;
-        let mut changeset_position_bottom = cli.start_changesets[8..11].parse::<u64>()?;
-        let mut changeset_position_middle_incremented = false;
-        let mut changeset_position_top_incremented = false;
-
-        loop {
-            // Check for cache and use it if it exists
-            let cache_file_path = format!(
-                "{}/changesets/{:03}/{:03}/{:03}.osm.gz",
-                cli.cache_path,
-                changeset_position_top,
-                changeset_position_middle,
-                changeset_position_bottom
-            );
-
-            if std::path::Path::new(&cache_file_path).exists() {
-                info!(
-                    "We already got the changeset file at {}. Skipping",
-                    cache_file_path
-                );
-
-                // Increment the changeset position
-                changeset_position_bottom += 1;
-                changeset_position_middle_incremented = false;
-                changeset_position_top_incremented = false;
-            } else {
-                {
-                    // First we download the changeset files
-                    let changeset_url = format!(
-                        "{}/{:03}/{:03}/{:03}.osm.gz",
-                        cli.changeset_server,
-                        changeset_position_top,
-                        changeset_position_middle,
-                        changeset_position_bottom
-                    );
-                    info!("Downloading changeset file from {}", changeset_url);
-                    let changeset_response: reqwest::Response =
-                        client.get(&changeset_url).send().await?;
-                    if changeset_response.status() == reqwest::StatusCode::NOT_FOUND {
-                        warn!("Changeset file not found at {}", changeset_url);
-                        // We've reached the end of the changesets for this bottom position.
-                        // If we incremented top and failed again, we're done.
-                        if changeset_position_top_incremented {
-                            info!("Finished or failed downloading changesets");
-                            info!(
-                                "Changeset position: {} {} {}",
-                                changeset_position_top,
-                                changeset_position_middle,
-                                changeset_position_bottom
-                            );
-                            warn!("Response body: {:?}", changeset_response.text().await?);
-                            // TODO: We want to have an endless loop here optionally so that we can keep trying to download changesets.
-                            break;
-                        }
-                        // We reset bottom to 0 and increment middle.
-                        // We also mark middle as incremented so that we increment top on the next failure.
-                        if !changeset_position_middle_incremented && changeset_position_bottom != 0
-                        {
-                            changeset_position_bottom = 0;
-                            changeset_position_middle += 1;
-                            changeset_position_middle_incremented = true;
-                            changeset_position_top_incremented = false;
-                        } else {
-                            changeset_position_middle_incremented = false;
-                            changeset_position_top += 1;
-                            changeset_position_top_incremented = true;
-                            changeset_position_middle = 0;
-                            changeset_position_bottom = 0;
-                        }
-                        continue;
-                    }
-                    let changeset_data = changeset_response.bytes().await?;
-                    info!("Caching changeset file to disk");
-                    std::fs::create_dir_all(
-                        std::path::Path::new(&cache_file_path).parent().unwrap(),
-                    )?;
-                    std::fs::write(&cache_file_path, &changeset_data)?;
-                    info!("Changeset file downloaded");
-                };
-
-                // TODO: We need to dynamically do this based on the data instead. Otherwise we dont have ram larrge enough
-                // let file = File::open(cache_file_path)?;
-                // let changeset_data = unsafe { Mmap::map(&file)? };
-
-                // let parsed_changeset = parse_changeset(&changeset_data)?;
-                // info!("Changeset file parsed");
-                // changesets.extend(parsed_changeset);
-
-                // Increment the changeset position
-                changeset_position_bottom += 1;
-                changeset_position_middle_incremented = false;
-                changeset_position_top_incremented = false;
-
-                // Wait a few seconds before downloading the next changeset file
-                tokio::time::sleep(Duration::from_millis(cli.wait_time)).await;
-            }
-        }
-    }
-
     // Data download metadata
-    let mut data_position_top = 0;
-    let mut data_position_middle = 0;
-    let mut data_position_bottom = 0;
-    let mut data_position_middle_incremented = false;
-    let mut data_position_top_incremented = false;
+    // TODO: We should probably detect where to resume from
+    let mut data_position_top = cli.start_data[0..3].parse::<u16>()?;
+    let mut data_position_middle = cli.start_data[4..7].parse::<u16>()?;
+    let mut data_position_bottom = cli.start_data[8..11].parse::<u16>()?;
 
     // Parse the changesets and convert them to git objects
     loop {
@@ -205,19 +86,29 @@ async fn main() -> Result<()> {
             info!("Using cached data file at {}", cache_file_path);
             let file = File::open(&cache_file_path)?;
             let data = unsafe { Mmap::map(&file)? };
-            convert_objects_to_git(
-                &repository,
-                &author,
-                &data,
-                cli.cache_path.clone(),
-                cli.use_torrents,
-            )?;
+            let changeset_location = format!("{}/changesets/torrents", cli.cache_path);
+            convert_objects_to_git(&repository, &author, &data, &changeset_location)?;
             info!("Data file parsed");
 
             // Increment the data position
-            data_position_bottom += 1;
-            data_position_middle_incremented = false;
-            data_position_top_incremented = false;
+            if data_position_top == 999
+                && data_position_middle == 999
+                && data_position_bottom == 999
+            {
+                // Uhhhhhh?!
+                break;
+            }
+
+            if data_position_middle == 999 && data_position_bottom == 999 {
+                data_position_middle = 0;
+                data_position_bottom = 0;
+                data_position_top += 1;
+            }
+
+            if data_position_bottom == 999 {
+                data_position_bottom = 0;
+                data_position_middle += 1;
+            }
         } else {
             {
                 // Download minute replication files and find the changesets that were modified in that minute
@@ -233,33 +124,30 @@ async fn main() -> Result<()> {
 
                 if data_response.status() == reqwest::StatusCode::NOT_FOUND {
                     warn!("data file not found at {}", data_url);
-                    // We've reached the end of the data for this bottom position.
-                    // If we incremented top and failed again, we're done.
-                    if data_position_top_incremented {
-                        info!("Finished or failed downloading data");
-                        info!(
-                            "Data position: {} {} {}",
-                            data_position_top, data_position_middle, data_position_bottom
-                        );
-                        warn!("Response body: {:?}", data_response.text().await?);
-
-                        // TODO: We want to have an endless loop here optionally so that we can keep trying to download changesets.
+                    // Increment the data position
+                    if data_position_top == 999
+                        && data_position_middle == 999
+                        && data_position_bottom == 999
+                    {
+                        // Uhhhhhh?!
                         break;
                     }
-                    // We reset bottom to 0 and increment middle.
-                    // We also mark middle as incremented so that we increment top on the next failure.
-                    if !data_position_middle_incremented && data_position_bottom != 0 {
-                        data_position_bottom = 0;
-                        data_position_middle += 1;
-                        data_position_middle_incremented = true;
-                        data_position_top_incremented = false;
-                    } else {
-                        data_position_middle_incremented = false;
-                        data_position_top += 1;
-                        data_position_top_incremented = true;
+
+                    if data_position_middle == 999 && data_position_bottom == 999 {
                         data_position_middle = 0;
                         data_position_bottom = 0;
+                        data_position_top += 1;
                     }
+
+                    if data_position_bottom == 999 {
+                        data_position_bottom = 0;
+                        data_position_middle += 1;
+                    }
+
+                    if data_position_bottom < 999 {
+                        data_position_bottom += 1;
+                    }
+
                     continue;
                 }
 
@@ -273,18 +161,32 @@ async fn main() -> Result<()> {
             let file = File::open(cache_file_path)?;
             let data = unsafe { Mmap::map(&file)? };
 
-            convert_objects_to_git(
-                &repository,
-                &author,
-                &data,
-                cli.cache_path.clone(),
-                cli.use_torrents,
-            )?;
+            let changeset_location = format!("{}/changesets/torrents", cli.cache_path);
+            convert_objects_to_git(&repository, &author, &data, &changeset_location)?;
 
             // Increment the data position
-            data_position_bottom += 1;
-            data_position_middle_incremented = false;
-            data_position_top_incremented = false;
+            if data_position_top == 999
+                && data_position_middle == 999
+                && data_position_bottom == 999
+            {
+                // Uhhhhhh?!
+                break;
+            }
+
+            if data_position_middle == 999 && data_position_bottom == 999 {
+                data_position_middle = 0;
+                data_position_bottom = 0;
+                data_position_top += 1;
+            }
+
+            if data_position_bottom == 999 {
+                data_position_bottom = 0;
+                data_position_middle += 1;
+            }
+
+            if data_position_bottom < 999 {
+                data_position_bottom += 1;
+            }
 
             // Wait a few seconds before downloading the next data file
             tokio::time::sleep(Duration::from_millis(cli.wait_time)).await;

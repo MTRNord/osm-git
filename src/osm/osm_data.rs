@@ -11,17 +11,15 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     convert::Infallible,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read, Write},
-    path::Path,
 };
 use time::{format_description::well_known::Iso8601, OffsetDateTime};
 use tracing::{debug, error, info, warn};
-use walkdir::WalkDir;
 
 use crate::git::commit;
 
-use super::changesets::{parse_changeset, Changeset};
+use super::changesets::{parse_changeset, uncompress_changeset_file, Changeset};
 
 const FILE_VERSION: &str = "0.1.0";
 
@@ -39,7 +37,7 @@ pub struct Node {
     pub legacy_object_version: Option<String>,
     pub lat: f64,
     pub lon: f64,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
 }
 impl Node {
@@ -104,9 +102,9 @@ impl Node {
             file_version: FILE_VERSION.to_string(),
         };
 
-        let mut element_buf = Vec::new();
+        let mut buf = Vec::new();
         loop {
-            let event = reader.read_event_into(&mut element_buf)?;
+            let event = reader.read_event_into(&mut buf)?;
 
             if let Event::End(ref e) = event {
                 if e.name() == element.name() {
@@ -132,8 +130,8 @@ impl Node {
                     node.tags.insert(key.to_string(), value.to_string());
                 } else {
                     warn!("Unexpected tag: {:?}", name);
-                    reader.read_to_end(name)?;
                 }
+                reader.read_to_end(name)?;
             } else {
                 if let Event::Text(ref text) = event {
                     if text.borrow().starts_with(b"\n") {
@@ -148,9 +146,10 @@ impl Node {
                 // Write the data to file for debugging
 
                 let mut file = std::fs::File::create("debug.xml")?;
-                file.write_all(&element_buf)?;
+                file.write_all(&buf)?;
                 file.sync_all()?;
             }
+            buf = Vec::new();
         }
 
         Ok(node)
@@ -169,9 +168,9 @@ pub struct Way {
     pub file_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legacy_object_version: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<u64>,
 }
 
@@ -228,9 +227,9 @@ impl Way {
             file_version: FILE_VERSION.to_string(),
         };
 
-        let mut element_buf = Vec::new();
+        let mut buf = Vec::new();
         loop {
-            let event = reader.read_event_into(&mut element_buf)?;
+            let event = reader.read_event_into(&mut buf)?;
 
             if let Event::End(ref e) = event {
                 if e.name() == element.name() {
@@ -272,8 +271,8 @@ impl Way {
                     );
                 } else {
                     warn!("Unexpected tag: {:?}", name);
-                    reader.read_to_end(name)?;
                 }
+                reader.read_to_end(name)?;
             } else {
                 if let Event::Text(ref text) = event {
                     if text.borrow().starts_with(b"\n") {
@@ -288,9 +287,10 @@ impl Way {
                 // Write the data to file for debugging
 
                 let mut file = std::fs::File::create("debug.xml")?;
-                file.write_all(&element_buf)?;
+                file.write_all(&buf)?;
                 file.sync_all()?;
             }
+            buf = Vec::new();
         }
 
         Ok(way)
@@ -319,9 +319,9 @@ pub struct Relation {
     pub file_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legacy_object_version: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member: Vec<RelationMember>,
 }
 
@@ -378,9 +378,9 @@ impl Relation {
             file_version: FILE_VERSION.to_string(),
         };
 
-        let mut element_buf = Vec::new();
+        let mut buf = Vec::new();
         loop {
-            let event = reader.read_event_into(&mut element_buf)?;
+            let event = reader.read_event_into(&mut buf)?;
 
             if let Event::End(ref e) = event {
                 if e.name() == element.name() {
@@ -435,8 +435,8 @@ impl Relation {
                     });
                 } else {
                     warn!("Unexpected tag: {:?}", name);
-                    reader.read_to_end(name)?;
                 }
+                reader.read_to_end(name)?;
             } else {
                 if let Event::Text(ref text) = event {
                     if text.borrow().starts_with(b"\n") {
@@ -451,9 +451,10 @@ impl Relation {
                 // Write the data to file for debugging
 
                 let mut file = std::fs::File::create("debug.xml")?;
-                file.write_all(&element_buf)?;
+                file.write_all(&buf)?;
                 file.sync_all()?;
             }
+            buf = Vec::new();
         }
 
         Ok(relation)
@@ -472,8 +473,7 @@ pub fn convert_objects_to_git(
     repository: &Repository,
     committer: &Signature,
     data: &[u8],
-    cache_folder: String,
-    use_torrents: bool,
+    changesets_location: &str,
 ) -> Result<()> {
     // If the file is empty we skip it
     if data.is_empty() {
@@ -483,7 +483,10 @@ pub fn convert_objects_to_git(
     // Decompress the changeset file
     let mut data_reader = GzDecoder::new(data);
     let mut file_data = String::new();
-    data_reader.read_to_string(&mut file_data)?;
+    if let Err(e) = data_reader.read_to_string(&mut file_data) {
+        error!("Unable to decompress data file: {:?}. Moving on", e);
+        return Ok(());
+    }
     debug!("Data file decompressed. Size: {}", file_data.len());
 
     // If the file is empty we skip it
@@ -503,6 +506,7 @@ pub fn convert_objects_to_git(
     data.expand_empty_elements(true);
 
     let mut buf = Vec::new();
+    let mut skip_buf = Vec::new();
     let mut created_or_modified_objects_for_changeset = BTreeMap::new();
     let mut deleted_objects_for_changeset = BTreeMap::new();
 
@@ -515,9 +519,8 @@ pub fn convert_objects_to_git(
 
                     let mut created_objects = Vec::new();
 
-                    let mut element_buf = Vec::new();
                     loop {
-                        let event = data.read_event_into(&mut element_buf)?;
+                        let event = data.read_event_into(&mut skip_buf)?;
 
                         if let Event::End(ref e) = event {
                             if e.name() == element.name() {
@@ -579,10 +582,12 @@ pub fn convert_objects_to_git(
                             file.write_all(file_data.as_bytes())?;
                             file.sync_all()?;
                         }
+                        skip_buf = Vec::new();
                     }
 
                     // write the objects to the git repo as yaml files
                     let repository_folder = repository.path().parent().unwrap();
+                    // TODO: We should chunk the world and split it into folders... Otherwise good luck
                     for object in created_objects {
                         let object_file_name = match object {
                             OSMObject::Node(ref node) => format!("{}.yaml", node.id),
@@ -610,9 +615,8 @@ pub fn convert_objects_to_git(
 
                     let mut deleted_objects = Vec::new();
 
-                    let mut element_buf = Vec::new();
                     loop {
-                        let event = data.read_event_into(&mut element_buf)?;
+                        let event = data.read_event_into(&mut skip_buf)?;
 
                         if let Event::End(ref e) = event {
                             if e.name() == element.name() {
@@ -674,6 +678,7 @@ pub fn convert_objects_to_git(
                             file.write_all(file_data.as_bytes())?;
                             file.sync_all()?;
                         }
+                        skip_buf = Vec::new();
                     }
 
                     // write the objects to the git repo as yaml files
@@ -685,9 +690,22 @@ pub fn convert_objects_to_git(
                             OSMObject::Relation(ref relation) => format!("{}.yaml", relation.id),
                         };
                         let object_file_path = repository_folder.join(object_file_name);
-
                         // Change the file according to the changeset
-                        let mut object_file = std::fs::File::open(object_file_path)?;
+
+                        // If we got the file we open it otherwise we create a new object
+                        if !object_file_path.exists() {
+                            // We need to create the file
+                            let object_file = OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .create(true)
+                                .open(object_file_path.clone())?;
+                            serde_yaml::to_writer(object_file, &object)?;
+                        }
+                        let mut object_file = OpenOptions::new()
+                            .read(true)
+                            .open(object_file_path.clone())?;
+
                         let mut file_object: OSMObject = serde_yaml::from_reader(&mut object_file)?;
 
                         match object {
@@ -726,12 +744,19 @@ pub fn convert_objects_to_git(
                                 }
                             }
                         }
+                        let object_file = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .truncate(true)
+                            .open(object_file_path)?;
+                        serde_yaml::to_writer(object_file, &object)?;
                         // Add the object to the list of created objects for the changeset based on the changeset id
                         let changeset = match object {
                             OSMObject::Node(ref node) => node.changeset,
                             OSMObject::Way(ref way) => way.changeset,
                             OSMObject::Relation(ref relation) => relation.changeset,
                         };
+
                         created_or_modified_objects_for_changeset
                             .entry(changeset)
                             .or_insert_with(Vec::new)
@@ -743,9 +768,8 @@ pub fn convert_objects_to_git(
 
                     let mut deleted_objects = Vec::new();
 
-                    let mut element_buf = Vec::new();
                     loop {
-                        let event = data.read_event_into(&mut element_buf)?;
+                        let event = data.read_event_into(&mut skip_buf)?;
 
                         if let Event::End(ref e) = event {
                             if e.name() == element.name() {
@@ -807,6 +831,7 @@ pub fn convert_objects_to_git(
                             file.write_all(file_data.as_bytes())?;
                             file.sync_all()?;
                         }
+                        skip_buf = Vec::new();
                     }
 
                     // write the objects to the git repo as yaml files
@@ -819,8 +844,10 @@ pub fn convert_objects_to_git(
                         };
                         let object_file_path = repository_folder.join(object_file_name);
 
-                        // Delete the file
-                        std::fs::remove_file(object_file_path)?;
+                        // Delete the file if it exists
+                        if object_file_path.exists() {
+                            std::fs::remove_file(object_file_path)?;
+                        }
 
                         // Add the object to the list of created objects for the changeset based on the changeset id
                         let changeset = match object {
@@ -839,6 +866,7 @@ pub fn convert_objects_to_git(
             Event::Eof => break, // exits the loop when reaching end of file
             _ => (),             // There are `Event` types not considered here
         }
+        buf = Vec::new();
     }
 
     // For all the objects changed apply the changesets as commits
@@ -848,16 +876,14 @@ pub fn convert_objects_to_git(
         .chain(deleted_objects_for_changeset.keys())
         .collect();
 
-    for changeset in changeset_list {
+    for changeset_id in changeset_list {
         // Find the changeset within the files of the cache
-        let changeset = find_changesets_in_cache(
-            cache_folder.clone(),
-            use_torrents,
-            *changeset,
-            None,
-            None,
-            None,
-        )?;
+        let changeset = find_changesets_in_cache(changesets_location, *changeset_id)?;
+
+        if changeset.is_none() {
+            warn!("Unable to find changeset {:?}", changeset_id);
+            continue;
+        }
 
         if let Some(changeset) = changeset {
             // Get comment tag if it exists and trim it
@@ -929,6 +955,13 @@ pub fn convert_objects_to_git(
             let note = changeset
                 .tags
                 .iter()
+                .filter_map(|(key, value)| {
+                    if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some((key, value))
+                    }
+                })
                 .map(|(key, value)| format!("{}: {}", key, value))
                 .collect::<Vec<String>>()
                 .join("\n");
@@ -954,91 +987,40 @@ pub fn convert_objects_to_git(
 ///
 /// The changeset if found
 fn find_changesets_in_cache(
-    cache_folder: String,
-    use_torrents: bool,
+    changesets_location: &str,
     changeset_id: u64,
-    changeset_position_top: Option<u64>,
-    changeset_position_middle: Option<u64>,
-    changeset_position_bottom: Option<u64>,
 ) -> Result<Option<Changeset>> {
-    // Changesets are of the format "{cache_folder}/changesets/{:03}/{:03}/{:03}.osm.gz".
-    //
-    // Each file has to be parsed using "parse_changeset(&changeset_data)?;"
+    let mut changeset = None;
 
-    let changeset_folder = if use_torrents {
-        format!("{}/changesets/torrents", cache_folder)
-    } else {
-        format!("{}/changesets", cache_folder)
-    };
-
-    if !use_torrents {
-        let mut changeset_position_top = changeset_position_top.unwrap_or(0);
-        let mut changeset_position_middle = changeset_position_middle.unwrap_or(0);
-        let mut changeset_position_bottom = changeset_position_bottom.unwrap_or(0);
-        let changeset_file = format!(
-            "{:03}/{:03}/{:03}.osm.gz",
-            changeset_position_top, changeset_position_middle, changeset_position_bottom
-        );
-        let changeset_path = format!("{}/{}", changeset_folder, changeset_file);
-
-        if !Path::new(&changeset_path).exists() {
-            return Ok(None);
-        }
-
-        let mut changeset_file = File::open(changeset_path)?;
-        let mut changeset_data = Vec::new();
-        changeset_file.read_to_end(&mut changeset_data)?;
-
-        let changesets = parse_changeset(&changeset_data)?;
-
-        // Check if the file has the correct changeset id in vector otherwise we recurse to the next file
-        if changesets.iter().any(|c| c.id == changeset_id) {
-            return Ok(changesets.into_iter().find(|c| c.id == changeset_id));
-        }
-
-        // We recurse to the next file since we found no changeset with the correct id
-
-        if changeset_position_top == 999
-            && changeset_position_middle == 999
-            && changeset_position_bottom == 999
-        {
-            // Uhhhhhh?!
-            return Ok(None);
-        }
-
-        if changeset_position_middle == 999 && changeset_position_bottom == 999 {
-            changeset_position_middle = 0;
-            changeset_position_bottom = 0;
-            changeset_position_top += 1;
-        }
-
-        if changeset_position_bottom == 999 {
-            changeset_position_bottom = 0;
-            changeset_position_middle += 1;
-        }
-
-        find_changesets_in_cache(
-            cache_folder,
-            use_torrents,
-            changeset_id,
-            Some(changeset_position_top),
-            Some(changeset_position_middle),
-            Some(changeset_position_bottom),
-        )
-    } else {
-        let mut changeset: Option<Changeset> = None;
-
-        for entry in WalkDir::new(changeset_folder) {
-            let mut changeset_file = File::open(entry?.path())?;
-            let mut changeset_data = Vec::new();
-            changeset_file.read_to_end(&mut changeset_data)?;
-
-            let changesets = parse_changeset(&changeset_data)?;
-            if changesets.iter().any(|c| c.id == changeset_id) {
-                changeset = changesets.into_iter().find(|c| c.id == changeset_id);
+    // Find latest changeset file (highest number in filename after "changesets-" and before ".osm.zst")
+    let changeset_files = std::fs::read_dir(changesets_location)?;
+    let mut last_highest_id = 0;
+    let mut changeset_path = String::new();
+    for changeset_file in changeset_files {
+        let changeset_file = changeset_file?;
+        let changeset_file_path = changeset_file.path();
+        let changeset_file_name = changeset_file_path.file_name().unwrap().to_str().unwrap();
+        let changeset_file_name = changeset_file_name.trim_end_matches(".osm.zst");
+        let changeset_file_name = changeset_file_name.trim_start_matches("changesets-");
+        let changeset_file_name = changeset_file_name.parse::<u64>();
+        if let Ok(changeset_file_name) = changeset_file_name {
+            if changeset_file_name > last_highest_id {
+                last_highest_id = changeset_file_name;
+                changeset_path = changeset_file_path.to_str().unwrap().to_string();
             }
         }
-
-        Ok(changeset)
     }
+
+    let changeset_file = File::open(changeset_path)?;
+    let mut uncompressed_data = uncompress_changeset_file(changeset_file);
+
+    let changesets = parse_changeset(&mut uncompressed_data, Some(changeset_id));
+
+    if let Ok(changesets) = changesets {
+        if changesets.iter().any(|c| c.id == changeset_id) {
+            changeset = changesets.into_iter().find(|c| c.id == changeset_id);
+        }
+    }
+
+    Ok(changeset)
 }

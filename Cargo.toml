@@ -9,7 +9,7 @@ edition = "2021"
 bytes = "1.4.0"
 clap = { version = "4.3.0", features = ["derive"] }
 color-eyre = "0.6.2"
-flate2 = "1.0.26"
+flate2 = { version = "1.0.26" }
 git2 = "0.17.1"
 memmap2 = "0.6.1"
 quick-xml = { version = "0.28.2", features = ["async-tokio", "encoding", "escape-html", "overlapped-lists"] }
@@ -20,4 +20,4 @@ time = { version = "0.3.21", features = ["formatting", "parsing"] }
 tokio = { version = "1.28.1", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
-walkdir = "2.3.3"
+zstd = { version = "0.12.3", features = ["zstdmt"] }
