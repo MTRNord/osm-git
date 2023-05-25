@@ -10,7 +10,7 @@ bytes = "1.4.0"
 clap = { version = "4.3.0", features = ["derive"] }
 color-eyre = "0.6.2"
 flate2 = { version = "1.0.26" }
-git2 = "0.17.1"
+gix = "0.44.1"
 memmap2 = "0.6.1"
 quick-xml = { version = "0.28.2", features = ["async-tokio", "encoding", "escape-html", "overlapped-lists"] }
 reqwest = { version = "0.11.18", default-features = false, features = ["rustls-tls", "gzip", "stream", "trust-dns"] }

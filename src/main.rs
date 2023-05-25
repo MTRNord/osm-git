@@ -2,7 +2,7 @@ use std::{fs::File, time::Duration};
 
 use clap::Parser;
 use color_eyre::eyre::Result;
-use git2::Signature;
+use gix::{actor::Signature, bstr::BString, date::Time};
 use memmap2::Mmap;
 use tracing::{info, warn};
 
@@ -63,7 +63,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let author = Signature::now("osm-git-replay", "osm-git-replay@localhost")?;
+    let author = Signature {
+        name: BString::from("osm-git-replay"),
+        email: BString::from("osm-git-replay@localhost"),
+        time: Time::now_local_or_utc(),
+    };
 
     let repository = init_git_repository(&cli.git_repo_path, &cli.replication_server, &author)?;
     info!("Git repository initialized");
