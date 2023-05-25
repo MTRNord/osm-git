@@ -41,7 +41,7 @@ pub struct Node {
     pub tags: BTreeMap<String, String>,
 }
 impl Node {
-    fn new_from_element(reader: &mut Reader<&[u8]>, element: BytesStart) -> Result<Self> {
+    fn new_from_element(reader: &mut Reader<&[u8]>, element: &BytesStart) -> Result<Self> {
         let attributes: BTreeMap<String, String> = element
             .attributes()
             .filter_map(|attr_result| attr_result.ok())
@@ -175,7 +175,7 @@ pub struct Way {
 }
 
 impl Way {
-    fn new_from_element(reader: &mut Reader<&[u8]>, element: BytesStart) -> Result<Self> {
+    fn new_from_element(reader: &mut Reader<&[u8]>, element: &BytesStart) -> Result<Self> {
         let attributes: BTreeMap<String, String> = element
             .attributes()
             .filter_map(|attr_result| attr_result.ok())
@@ -326,7 +326,7 @@ pub struct Relation {
 }
 
 impl Relation {
-    fn new_from_element(reader: &mut Reader<&[u8]>, element: BytesStart) -> Result<Self> {
+    fn new_from_element(reader: &mut Reader<&[u8]>, element: &BytesStart) -> Result<Self> {
         let attributes: BTreeMap<String, String> = element
             .attributes()
             .filter_map(|attr_result| attr_result.ok())
@@ -531,7 +531,7 @@ pub fn convert_objects_to_git(
                         if let Event::Start(ref e) = event {
                             let name = e.name();
                             if name == QName(b"node") {
-                                let node = Node::new_from_element(&mut data, e.clone());
+                                let node = Node::new_from_element(&mut data, e);
                                 match node {
                                     Ok(node) => created_objects.push(OSMObject::Node(node)),
                                     Err(err) => {
@@ -542,7 +542,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"way") {
-                                let way = Way::new_from_element(&mut data, e.clone());
+                                let way = Way::new_from_element(&mut data, &e);
                                 match way {
                                     Ok(way) => created_objects.push(OSMObject::Way(way)),
                                     Err(err) => {
@@ -553,7 +553,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"relation") {
-                                let relation = Relation::new_from_element(&mut data, e.clone());
+                                let relation = Relation::new_from_element(&mut data, &e);
                                 match relation {
                                     Ok(relation) => {
                                         created_objects.push(OSMObject::Relation(relation))
@@ -627,7 +627,7 @@ pub fn convert_objects_to_git(
                         if let Event::Start(ref e) = event {
                             let name = e.name();
                             if name == QName(b"node") {
-                                let node = Node::new_from_element(&mut data, e.clone());
+                                let node = Node::new_from_element(&mut data, &e);
                                 match node {
                                     Ok(node) => deleted_objects.push(OSMObject::Node(node)),
                                     Err(err) => {
@@ -638,7 +638,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"way") {
-                                let way = Way::new_from_element(&mut data, e.clone());
+                                let way = Way::new_from_element(&mut data, &e);
                                 match way {
                                     Ok(way) => deleted_objects.push(OSMObject::Way(way)),
                                     Err(err) => {
@@ -649,7 +649,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"relation") {
-                                let relation = Relation::new_from_element(&mut data, e.clone());
+                                let relation = Relation::new_from_element(&mut data, &e);
                                 match relation {
                                     Ok(relation) => {
                                         deleted_objects.push(OSMObject::Relation(relation))
@@ -699,12 +699,11 @@ pub fn convert_objects_to_git(
                                 .read(true)
                                 .write(true)
                                 .create(true)
-                                .open(object_file_path.clone())?;
+                                .open(&object_file_path)?;
                             serde_yaml::to_writer(object_file, &object)?;
                         }
-                        let mut object_file = OpenOptions::new()
-                            .read(true)
-                            .open(object_file_path.clone())?;
+                        let mut object_file =
+                            OpenOptions::new().read(true).open(&object_file_path)?;
 
                         let mut file_object: OSMObject = serde_yaml::from_reader(&mut object_file)?;
 
@@ -780,7 +779,7 @@ pub fn convert_objects_to_git(
                         if let Event::Start(ref e) = event {
                             let name = e.name();
                             if name == QName(b"node") {
-                                let node = Node::new_from_element(&mut data, e.clone());
+                                let node = Node::new_from_element(&mut data, &e);
                                 match node {
                                     Ok(node) => deleted_objects.push(OSMObject::Node(node)),
                                     Err(err) => {
@@ -791,7 +790,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"way") {
-                                let way = Way::new_from_element(&mut data, e.clone());
+                                let way = Way::new_from_element(&mut data, &e);
                                 match way {
                                     Ok(way) => deleted_objects.push(OSMObject::Way(way)),
                                     Err(err) => {
@@ -802,7 +801,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"relation") {
-                                let relation = Relation::new_from_element(&mut data, e.clone());
+                                let relation = Relation::new_from_element(&mut data, &e);
                                 match relation {
                                     Ok(relation) => {
                                         deleted_objects.push(OSMObject::Relation(relation))
@@ -858,7 +857,21 @@ pub fn convert_objects_to_git(
                         deleted_objects_for_changeset
                             .entry(changeset)
                             .or_insert_with(Vec::new)
-                            .push(object);
+                            .push(object.clone());
+                        // Remove it from the list of created objects if it exists
+                        if let Some(index) = created_or_modified_objects_for_changeset
+                            .get_mut(&changeset)
+                            .and_then(|objects| {
+                                objects
+                                    .iter()
+                                    .position(|existing_object| *existing_object == object)
+                            })
+                        {
+                            created_or_modified_objects_for_changeset
+                                .get_mut(&changeset)
+                                .unwrap()
+                                .remove(index);
+                        }
                     }
                 }
                 _ => (),
@@ -871,14 +884,39 @@ pub fn convert_objects_to_git(
 
     // For all the objects changed apply the changesets as commits
     // Get changeset list from BTreeMaps
-    let changeset_list: Vec<&u64> = created_or_modified_objects_for_changeset
+    let changeset_list: Vec<u64> = created_or_modified_objects_for_changeset
         .keys()
         .chain(deleted_objects_for_changeset.keys())
+        .copied()
         .collect();
+
+    // Find latest changeset file (highest number in filename after "changesets-" and before ".osm.zst")
+    let changeset_files = std::fs::read_dir(changesets_location)?;
+    let mut last_highest_id = 0;
+    let mut changeset_path = String::new();
+    for changeset_file in changeset_files {
+        let changeset_file = changeset_file?;
+        let changeset_file_path = changeset_file.path();
+        let changeset_file_name = changeset_file_path.file_name().unwrap().to_str().unwrap();
+        let changeset_file_name = changeset_file_name.trim_end_matches(".osm.zst");
+        let changeset_file_name = changeset_file_name.trim_start_matches("changesets-");
+        let changeset_file_name = changeset_file_name.parse::<u64>();
+        if let Ok(changeset_file_name) = changeset_file_name {
+            if changeset_file_name > last_highest_id {
+                last_highest_id = changeset_file_name;
+                changeset_path = changeset_file_path.to_str().unwrap().to_string();
+            }
+        }
+    }
+
+    let changeset_file = File::open(changeset_path)?;
+    let mut uncompressed_data = uncompress_changeset_file(changeset_file);
+
+    let changesets = parse_changeset(&mut uncompressed_data, &changeset_list)?;
 
     for changeset_id in changeset_list {
         // Find the changeset within the files of the cache
-        let changeset = find_changesets_in_cache(changesets_location, *changeset_id)?;
+        let changeset = find_changesets_in_cache(&changesets, changeset_id)?;
 
         if changeset.is_none() {
             warn!("Unable to find changeset {:?}", changeset_id);
@@ -966,10 +1004,14 @@ pub fn convert_objects_to_git(
                 .collect::<Vec<String>>()
                 .join("\n");
 
-            repository.note(&author, committer, None, oid, &note, false)?;
+            // Add the id of the changeset to the note
+            let note = if note.is_empty() {
+                format!("Legacy Changeset ID: {}", changeset.id)
+            } else {
+                format!("Legacy Changeset ID: {}\n{}", changeset.id, note)
+            };
 
-            // We make sure to not keep it around since this would get large quite quickly
-            drop(changeset);
+            repository.note(&author, committer, None, oid, &note, false)?;
         }
     }
 
@@ -987,39 +1029,13 @@ pub fn convert_objects_to_git(
 ///
 /// The changeset if found
 fn find_changesets_in_cache(
-    changesets_location: &str,
+    changesets: &[Changeset],
     changeset_id: u64,
-) -> Result<Option<Changeset>> {
+) -> Result<Option<&Changeset>> {
     let mut changeset = None;
 
-    // Find latest changeset file (highest number in filename after "changesets-" and before ".osm.zst")
-    let changeset_files = std::fs::read_dir(changesets_location)?;
-    let mut last_highest_id = 0;
-    let mut changeset_path = String::new();
-    for changeset_file in changeset_files {
-        let changeset_file = changeset_file?;
-        let changeset_file_path = changeset_file.path();
-        let changeset_file_name = changeset_file_path.file_name().unwrap().to_str().unwrap();
-        let changeset_file_name = changeset_file_name.trim_end_matches(".osm.zst");
-        let changeset_file_name = changeset_file_name.trim_start_matches("changesets-");
-        let changeset_file_name = changeset_file_name.parse::<u64>();
-        if let Ok(changeset_file_name) = changeset_file_name {
-            if changeset_file_name > last_highest_id {
-                last_highest_id = changeset_file_name;
-                changeset_path = changeset_file_path.to_str().unwrap().to_string();
-            }
-        }
-    }
-
-    let changeset_file = File::open(changeset_path)?;
-    let mut uncompressed_data = uncompress_changeset_file(changeset_file);
-
-    let changesets = parse_changeset(&mut uncompressed_data, Some(changeset_id));
-
-    if let Ok(changesets) = changesets {
-        if changesets.iter().any(|c| c.id == changeset_id) {
-            changeset = changesets.into_iter().find(|c| c.id == changeset_id);
-        }
+    if changesets.iter().any(|c| c.id == changeset_id) {
+        changeset = changesets.iter().find(|c| c.id == changeset_id);
     }
 
     Ok(changeset)
