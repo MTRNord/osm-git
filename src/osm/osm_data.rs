@@ -469,6 +469,16 @@ pub enum OSMObject {
     Relation(Relation),
 }
 
+impl OSMObject {
+    pub fn id(&self) -> u64 {
+        match self {
+            OSMObject::Node(node) => node.id,
+            OSMObject::Way(way) => way.id,
+            OSMObject::Relation(relation) => relation.id,
+        }
+    }
+}
+
 pub fn convert_objects_to_git(
     repository: &Repository,
     committer: &Signature,
@@ -542,7 +552,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"way") {
-                                let way = Way::new_from_element(&mut data, &e);
+                                let way = Way::new_from_element(&mut data, e);
                                 match way {
                                     Ok(way) => created_objects.push(OSMObject::Way(way)),
                                     Err(err) => {
@@ -553,7 +563,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"relation") {
-                                let relation = Relation::new_from_element(&mut data, &e);
+                                let relation = Relation::new_from_element(&mut data, e);
                                 match relation {
                                     Ok(relation) => {
                                         created_objects.push(OSMObject::Relation(relation))
@@ -595,7 +605,13 @@ pub fn convert_objects_to_git(
                             OSMObject::Relation(ref relation) => format!("{}.yaml", relation.id),
                         };
                         let object_file_path = repository_folder.join(object_file_name);
-                        let object_file = std::fs::File::create(object_file_path)?;
+
+                        // We need to create the file
+                        let object_file = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .open(&object_file_path)?;
                         serde_yaml::to_writer(object_file, &object)?;
 
                         // Add the object to the list of created objects for the changeset based on the changeset id
@@ -627,7 +643,7 @@ pub fn convert_objects_to_git(
                         if let Event::Start(ref e) = event {
                             let name = e.name();
                             if name == QName(b"node") {
-                                let node = Node::new_from_element(&mut data, &e);
+                                let node = Node::new_from_element(&mut data, e);
                                 match node {
                                     Ok(node) => deleted_objects.push(OSMObject::Node(node)),
                                     Err(err) => {
@@ -638,7 +654,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"way") {
-                                let way = Way::new_from_element(&mut data, &e);
+                                let way = Way::new_from_element(&mut data, e);
                                 match way {
                                     Ok(way) => deleted_objects.push(OSMObject::Way(way)),
                                     Err(err) => {
@@ -649,7 +665,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"relation") {
-                                let relation = Relation::new_from_element(&mut data, &e);
+                                let relation = Relation::new_from_element(&mut data, e);
                                 match relation {
                                     Ok(relation) => {
                                         deleted_objects.push(OSMObject::Relation(relation))
@@ -779,7 +795,7 @@ pub fn convert_objects_to_git(
                         if let Event::Start(ref e) = event {
                             let name = e.name();
                             if name == QName(b"node") {
-                                let node = Node::new_from_element(&mut data, &e);
+                                let node = Node::new_from_element(&mut data, e);
                                 match node {
                                     Ok(node) => deleted_objects.push(OSMObject::Node(node)),
                                     Err(err) => {
@@ -790,7 +806,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"way") {
-                                let way = Way::new_from_element(&mut data, &e);
+                                let way = Way::new_from_element(&mut data, e);
                                 match way {
                                     Ok(way) => deleted_objects.push(OSMObject::Way(way)),
                                     Err(err) => {
@@ -801,7 +817,7 @@ pub fn convert_objects_to_git(
                                     }
                                 }
                             } else if name == QName(b"relation") {
-                                let relation = Relation::new_from_element(&mut data, &e);
+                                let relation = Relation::new_from_element(&mut data, e);
                                 match relation {
                                     Ok(relation) => {
                                         deleted_objects.push(OSMObject::Relation(relation))
@@ -858,20 +874,6 @@ pub fn convert_objects_to_git(
                             .entry(changeset)
                             .or_insert_with(Vec::new)
                             .push(object.clone());
-                        // Remove it from the list of created objects if it exists
-                        if let Some(index) = created_or_modified_objects_for_changeset
-                            .get_mut(&changeset)
-                            .and_then(|objects| {
-                                objects
-                                    .iter()
-                                    .position(|existing_object| *existing_object == object)
-                            })
-                        {
-                            created_or_modified_objects_for_changeset
-                                .get_mut(&changeset)
-                                .unwrap()
-                                .remove(index);
-                        }
                     }
                 }
                 _ => (),
@@ -895,6 +897,18 @@ pub fn convert_objects_to_git(
     let mut last_highest_id = 0;
     let mut changeset_path = String::new();
     for changeset_file in changeset_files {
+        // Delete all objects by id that are in deleted_objects_for_changeset from created_or_modified_objects_for_changeset
+        let deleted_ids: Vec<u64> = deleted_objects_for_changeset
+            .values()
+            .flatten()
+            .map(|object| object.id())
+            .collect();
+        created_or_modified_objects_for_changeset
+            .iter_mut()
+            .for_each(|(_, objects)| {
+                objects.retain(|object| !deleted_ids.contains(&object.id()));
+            });
+
         let changeset_file = changeset_file?;
         let changeset_file_path = changeset_file.path();
         let changeset_file_name = changeset_file_path.file_name().unwrap().to_str().unwrap();
@@ -913,6 +927,8 @@ pub fn convert_objects_to_git(
     let mut uncompressed_data = uncompress_changeset_file(changeset_file);
 
     let changesets = parse_changeset(&mut uncompressed_data, &changeset_list)?;
+
+    info!("Generating commits for changesets");
 
     for changeset_id in changeset_list {
         // Find the changeset within the files of the cache
@@ -1032,11 +1048,7 @@ fn find_changesets_in_cache(
     changesets: &[Changeset],
     changeset_id: u64,
 ) -> Result<Option<&Changeset>> {
-    let mut changeset = None;
-
-    if changesets.iter().any(|c| c.id == changeset_id) {
-        changeset = changesets.iter().find(|c| c.id == changeset_id);
-    }
+    let changeset = changesets.iter().find(|c| c.id == changeset_id);
 
     Ok(changeset)
 }

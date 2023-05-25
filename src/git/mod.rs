@@ -2,7 +2,7 @@ use std::{io::Write, path::Path};
 
 use color_eyre::eyre::Result;
 use git2::{Oid, Repository, Signature};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Initialize the git repository
 ///
@@ -102,7 +102,15 @@ pub fn commit(
             } else {
                 Path::new(&file)
             };
-            index.add_path(path)?;
+            // TODO: I am tired to actually debug this so we just do a sanity check if the file exists
+            if file_path.exists() {
+                index.add_path(path)?;
+            } else {
+                warn!(
+                    "File {} does not exist but was meant to be added",
+                    path.to_str().unwrap()
+                );
+            }
         }
         for file in removed_files {
             let file_path = Path::new(&file);
@@ -111,7 +119,10 @@ pub fn commit(
             } else {
                 Path::new(&file)
             };
-            index.remove_path(path)?;
+            // We check if it was tracked before. If not we don't need to remove it
+            if index.get_path(path, 0).is_some() {
+                index.remove_path(path)?;
+            }
         }
         index.write()?;
         index.write_tree()?

@@ -6,7 +6,7 @@ use quick_xml::{
 };
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     convert::Infallible,
     fs::File,
     io::{BufReader, Write},
@@ -33,7 +33,8 @@ impl Changeset {
     fn new_from_element(
         reader: &mut Reader<BufReader<Decoder<'_, BufReader<File>>>>,
         element: &BytesStart,
-    ) -> Result<Self> {
+        changeset_list: &[u64],
+    ) -> Result<Option<Self>> {
         let changeset_attributes: HashMap<String, String> = element
             .attributes()
             .filter_map(|attr_result| attr_result.ok())
@@ -66,6 +67,11 @@ impl Changeset {
             .collect();
 
         //debug!("changeset_attributes: {:?}", changeset_attributes);
+
+        let id = changeset_attributes.get("id").unwrap().parse().unwrap();
+        if !changeset_list.contains(&id) {
+            return Ok(None);
+        }
 
         let mut changeset = Changeset {
             id: changeset_attributes.get("id").unwrap().parse().unwrap(),
@@ -101,51 +107,55 @@ impl Changeset {
         loop {
             let event = reader.read_event_into(&mut new_buf)?;
 
-            if let Event::End(ref e) = event {
-                if e.name() == element.name() {
-                    break;
+            match event {
+                Event::End(ref e) => {
+                    if e.name() == element.name() {
+                        break;
+                    }
                 }
-            }
-            if let Event::Start(ref e) = event {
-                let name = e.name();
-                if name == QName(b"tag") {
-                    let mut key = Cow::Borrowed("");
-                    let mut value = Cow::Borrowed("");
+                Event::Start(ref e) => {
+                    let name = e.name();
+                    if name == QName(b"tag") {
+                        let mut key = Cow::Borrowed("");
+                        let mut value = Cow::Borrowed("");
 
-                    for attr_result in element.attributes() {
-                        let a = attr_result?;
-                        match a.key.as_ref() {
-                            b"k" => key = a.decode_and_unescape_value(reader)?,
-                            b"v" => value = a.decode_and_unescape_value(reader)?,
-                            _ => (),
+                        for attr_result in element.attributes() {
+                            let a = attr_result?;
+                            match a.key.as_ref() {
+                                b"k" => key = a.decode_and_unescape_value(reader)?,
+                                b"v" => value = a.decode_and_unescape_value(reader)?,
+                                _ => (),
+                            }
+                        }
+
+                        changeset.tags.insert(key.to_string(), value.to_string());
+                    } else {
+                        warn!("Unexpected tag: {:?}", name);
+                        //reader.read_to_end_into(e.name(), &mut new_buf);
+                    }
+                }
+                _ => {
+                    if let Event::Text(ref text) = event {
+                        if text.borrow().starts_with(b"\n") {
+                            continue;
+                        }
+                    } else if let Event::End(ref e) = event {
+                        if e.name() == QName(b"tag") {
+                            continue;
                         }
                     }
+                    warn!("Unexpected event in changeset: {:?}", event);
+                    // Write the data to file for debugging
 
-                    changeset.tags.insert(key.to_string(), value.to_string());
-                } else {
-                    warn!("Unexpected tag: {:?}", name);
+                    let mut file = std::fs::File::create("debug.xml")?;
+                    file.write_all(&new_buf)?;
+                    file.sync_all()?;
                 }
-            } else {
-                if let Event::Text(ref text) = event {
-                    if text.borrow().starts_with(b"\n") {
-                        continue;
-                    }
-                } else if let Event::End(ref e) = event {
-                    if e.name() == QName(b"tag") {
-                        continue;
-                    }
-                }
-                warn!("Unexpected event in changeset: {:?}", event);
-                // Write the data to file for debugging
-
-                let mut file = std::fs::File::create("debug.xml")?;
-                file.write_all(&new_buf)?;
-                file.sync_all()?;
             }
             new_buf = Vec::new();
         }
 
-        Ok(changeset)
+        Ok(Some(changeset))
     }
 }
 
@@ -170,23 +180,33 @@ pub fn parse_changeset(
     changeset_data.expand_empty_elements(true);
 
     let mut changesets = Vec::new();
+    let changeset_hashset = changeset_list.iter().cloned().collect::<BTreeSet<u64>>();
     let mut buf = Vec::new();
 
     // Parse the changeset file
     info!("Parsing changeset file");
     loop {
+        // If we already have all of them then break
+        // We compare the ids even if its a little more expensive
+        let ids_parsed = changesets
+            .iter()
+            .map(|c: &Changeset| c.id)
+            .collect::<BTreeSet<u64>>();
+        if changeset_hashset.is_subset(&ids_parsed) {
+            break;
+        }
+
         let event = changeset_data.read_event_into(&mut buf)?;
         match event {
             Event::Start(element) => {
                 if let b"changeset" = element.name().as_ref() {
                     // TODO: What do we do in case of an error?
-                    let changeset = Changeset::new_from_element(changeset_data, &element);
+                    let changeset =
+                        Changeset::new_from_element(changeset_data, &element, changeset_list);
 
                     match changeset {
-                        Ok(changeset) => {
-                            if changeset_list.contains(&changeset.id) {
-                                changesets.push(changeset);
-                            }
+                        Ok(Some(changeset)) => {
+                            changesets.push(changeset);
                         }
                         Err(err) => {
                             error!(
@@ -194,8 +214,10 @@ pub fn parse_changeset(
                                 &element, err
                             );
                         }
+                        _ => {}
                     }
                 }
+                //changeset_data.read_to_end_into(element.name(), &mut buf);
             }
             Event::Eof => break, // exits the loop when reaching end of file
             _ => (),             // There are `Event` types not considered here
