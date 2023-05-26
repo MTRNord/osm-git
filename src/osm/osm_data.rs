@@ -1,6 +1,6 @@
 use color_eyre::eyre::Result;
 use flate2::bufread::GzDecoder;
-use gix::{actor::Signature, date::Time, ThreadSafeRepository};
+use git2::{Repository, Signature, Time};
 use quick_xml::{
     events::{BytesStart, Event},
     name::QName,
@@ -480,7 +480,7 @@ impl OSMObject {
 }
 
 pub fn convert_objects_to_git(
-    repository: &ThreadSafeRepository,
+    repository: &Repository,
     committer: &Signature,
     data: &[u8],
     changesets_location: &str,
@@ -955,11 +955,12 @@ pub fn convert_objects_to_git(
             let commit_time =
                 OffsetDateTime::parse(changeset_time.as_str(), &Iso8601::DEFAULT)?.unix_timestamp();
 
-            let author = Signature {
-                name: changeset.user.clone().into(),
-                email: format!("{}@osm", changeset.user).into(),
-                time: Time::new(commit_time.try_into().unwrap(), 0),
-            };
+            let author = git2::Signature::new(
+                &changeset.user,
+                &format!("{}@osm", changeset.user),
+                &Time::new(commit_time, 0),
+            )
+            .expect("Unable to create author signature");
 
             let repository_folder = repository.path().parent().unwrap();
 
@@ -994,6 +995,16 @@ pub fn convert_objects_to_git(
                 })
                 .map(|path| path.to_string_lossy().to_string())
                 .collect::<Vec<String>>();
+
+            let oid = commit(
+                repository,
+                added_or_changed_files,
+                removed_files,
+                comment,
+                &author,
+                committer,
+            )?;
+
             // Convert tags to "Key: Value" strings separated by newlines for the note
             let note = changeset
                 .tags
@@ -1011,21 +1022,12 @@ pub fn convert_objects_to_git(
 
             // Add the id of the changeset to the note
             let note = if note.is_empty() {
-                format!("{comment}\n\nLegacy Changeset ID: {}", changeset.id)
+                format!("Legacy Changeset ID: {}", changeset.id)
             } else {
-                format!(
-                    "{comment}\n\nLegacy Changeset ID: {}\n{}",
-                    changeset.id, note
-                )
+                format!("Legacy Changeset ID: {}\n{}", changeset.id, note)
             };
-            commit(
-                repository,
-                added_or_changed_files,
-                removed_files,
-                &note,
-                &author,
-                committer,
-            )?;
+
+            repository.note(&author, committer, None, oid, &note, false)?;
         }
     }
 
